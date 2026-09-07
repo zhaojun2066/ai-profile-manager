@@ -448,7 +448,19 @@ impl OutputFanout {
             .position(|window| window == SYNCHRONIZED_OUTPUT_START)
             .or_else(|| Self::csi_sequence_crossing(data, start).map(|end| end - start))
             .unwrap_or(0);
-        &tail[safe_offset..]
+        let safe_start = Self::skip_utf8_continuation_bytes(data, start + safe_offset);
+        &data[safe_start..]
+    }
+
+    /// A byte-based ring boundary can cut through a multibyte UTF-8 scalar.
+    /// Drop only its orphaned continuation bytes; the rest of the terminal
+    /// stream remains byte-for-byte intact and can be replayed without `�`.
+    fn skip_utf8_continuation_bytes(data: &[u8], start: usize) -> usize {
+        let mut index = start;
+        while index < data.len() && (0x80..=0xbf).contains(&data[index]) {
+            index += 1;
+        }
+        index
     }
 
     /// Detects a CSI sequence which began shortly before the nominal tail and
@@ -604,6 +616,17 @@ mod tests {
         let tail = OutputFanout::replay_safe_tail(output, 13);
 
         assert_eq!(tail, b"plain output");
+    }
+
+    #[test]
+    fn replay_safe_tail_skips_a_utf8_continuation_at_the_boundary() {
+        let mut output = b"old-output".to_vec();
+        output.extend_from_slice("你restored output".as_bytes());
+        let start = b"old-output".len() + 1;
+
+        let tail = OutputFanout::replay_safe_tail(&output, output.len() - start);
+
+        assert_eq!(tail, b"restored output");
     }
 
     #[test]
