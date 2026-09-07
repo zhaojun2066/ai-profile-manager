@@ -2,7 +2,7 @@ use super::{pty_sock_path, PtyAttachHandle};
 use crate::error::{AgentError, Result};
 use crate::session::env::{prepare_tool_env, resolve_tool_path};
 use crate::session::input::InputMerger;
-use crate::session::output::{remove_log_lock, OutputFanout};
+use crate::session::output::{remove_replay_log, OutputFanout};
 use crate::session::store::SessionStore;
 use crate::session::types::{
     ManagedSession, SessionKind, SessionStatus, SessionSummary, ViewportOwner,
@@ -224,8 +224,8 @@ impl SessionManager {
         if sock.exists() {
             let _ = std::fs::remove_file(&sock);
         }
-        // 清理日志文件锁条目，防止长期运行内存泄漏
-        remove_log_lock(nid);
+        // 此路径已强制终止 PTY；删除完整回放日志，避免已结束会话占用磁盘。
+        remove_replay_log(nid);
         // 清理持久化文件
         super::persistence::delete_session_record(nid);
 
@@ -251,6 +251,10 @@ impl SessionManager {
 
         session.status = SessionStatus::Ended;
         self.store.insert(session).await?;
+        // Relay sessions do not own a local PTY reader, so this is their only
+        // common terminal lifecycle exit. Native sessions may already have
+        // removed the log after their final PTY flush; deletion is idempotent.
+        remove_replay_log(&nid);
         // 清理持久化文件
         super::persistence::delete_session_record(&nid);
         Ok(Some(crate::proto::OutgoingMessage::SessionEnded {
@@ -954,8 +958,8 @@ impl SessionManager {
                     .remove(&cleanup_nid);
                 tracing::debug!(session_id=%cleanup_nid, "PTY master 已清理");
             }
-            // 清理日志文件锁条目，防止长期运行内存泄漏
-            remove_log_lock(&cleanup_nid);
+            // PTY 已 EOF 且最终输出已 flush；现在才可以删除完整回放日志。
+            remove_replay_log(&cleanup_nid);
             match result {
                 Ok(()) => tracing::info!(session_id=%sid, "PTY EOF"),
                 Err(e) => tracing::warn!(session_id=%sid, error=%e, "PTY read error"),

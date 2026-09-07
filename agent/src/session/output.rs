@@ -24,7 +24,9 @@ pub(crate) struct OutputFanoutInner {
     buffer: std::sync::Mutex<Vec<u8>>,
     /// 额外的 output subscriber（供 attach_pty 注册）
     extra_subscribers: std::sync::Mutex<Vec<mpsc::UnboundedSender<Vec<u8>>>>,
-    /// 环形日志路径（~/.kn/agent/sessions/{nid}/output.log），最大 256KB
+    /// 活跃会话的完整原始输出日志（~/.kn/agent/sessions/{nid}/output.log）。
+    /// 会话结束后由 SessionManager 删除；运行中不截断，确保新终端能从
+    /// 会话起点重放到当前屏幕状态。
     log_path: PathBuf,
     /// 日志当前大小（避免每次 fstat）
     log_size: std::sync::atomic::AtomicU64,
@@ -45,10 +47,10 @@ pub struct ReplayLogResult {
 static STATIC_LOG_SIZES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<AtomicU64>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// 全局日志文件写入锁表，防止并发 append + trim 导致的数据丢失。
+/// 全局日志文件写入锁表，防止并发 append 与结束清理导致的数据丢失。
 /// key = 日志文件规范路径, value = Mutex<()>。
-/// `append_log` 和 `trim_log_head` 通过此锁串行化，避免两个并发上下文
-/// （spawn_blocking PTY reader + 100ms timer flush）的写-读-写竞争。
+/// `append_log` 和 `remove_replay_log` 通过此锁串行化，避免两个并发上下文
+/// （PTY reader / relay output 与结束清理）竞争同一文件。
 static LOG_FILE_LOCKS: std::sync::LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -72,6 +74,26 @@ pub(crate) fn remove_log_lock(nid: &str) {
     map.remove(&canonical);
 }
 
+/// Deletes a complete replay log only after its PTY has stopped producing
+/// output. Active sessions retain their entire stream for iOS recovery.
+pub(crate) fn remove_replay_log(nid: &str) {
+    let log_path = kn_common::path::agent_dir()
+        .join("sessions")
+        .join(nid)
+        .join("output.log");
+    let lock = get_log_lock(&log_path);
+    {
+        let _guard = lock.lock().unwrap();
+        if let Err(error) = std::fs::remove_file(&log_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(nid = %nid, path = %log_path.display(), error = %error, "删除已结束会话回放日志失败");
+            }
+        }
+    }
+    remove_log_lock(nid);
+    STATIC_LOG_SIZES.lock().unwrap().remove(nid);
+}
+
 /// 获取或初始化指定 nid 的日志大小 AtomicU64。供 `append_log_static` 复用。
 pub(crate) fn get_static_log_size(nid: &str) -> Arc<AtomicU64> {
     let mut map = STATIC_LOG_SIZES.lock().unwrap();
@@ -87,13 +109,8 @@ pub(crate) fn get_static_log_size(nid: &str) -> Arc<AtomicU64> {
         .clone()
 }
 
-/// 环形日志最大字节数
-const OUTPUT_LOG_MAX_SIZE: u64 = 256 * 1024;
-/// 截断后保留的尾部字节数
-const OUTPUT_LOG_KEEP_TAIL: u64 = 192 * 1024;
-/// Codex wraps atomic screen updates with this marker.  Keeping a replay log
-/// from one of these boundaries ensures a freshly-created terminal does not
-/// start in the middle of a CSI sequence after ring-buffer truncation.
+/// Codex wraps atomic screen updates with this marker. It remains useful when
+/// reading legacy, previously-truncated logs during an upgrade.
 const SYNCHRONIZED_OUTPUT_START: &[u8] = b"\x1b[?2026h";
 
 impl OutputFanout {
@@ -314,7 +331,8 @@ impl OutputFanout {
         }
     }
 
-    /// 追加写入环形日志，超过 OUTPUT_LOG_MAX_SIZE 时截掉头部。
+    /// 追加写入活跃会话的完整日志。日志在会话实际结束时删除；不能在运行中
+    /// 截断，否则全屏 CLI 的后续增量帧无法重建一个新终端的屏幕基线。
     ///
     /// 使用 per-file Mutex 防止两个并发上下文（spawn_blocking PTY reader +
     /// 100ms timer flush）的 write-all → trim 序列互相穿插导致数据丢失。
@@ -341,16 +359,12 @@ impl OutputFanout {
                 return;
             }
         }
-        let new_size = log_size.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed)
-            + data.len() as u64;
-        if new_size > OUTPUT_LOG_MAX_SIZE {
-            Self::trim_log_head(path, log_size);
-        }
+        log_size.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 供 relay 模式使用：不依赖 OutputFanout 实例，直接从 nid 写入 ring log。
-    /// 通过全局 `STATIC_LOG_SIZES` 表复用 log_size 跟踪，确保 256KB 截断
-    /// 在多次调用间正确累积。
+    /// 供 relay 模式使用：不依赖 OutputFanout 实例，直接从 nid 写入完整活动日志。
+    /// 通过全局 `STATIC_LOG_SIZES` 表复用 log_size 跟踪，避免 relay 模式每次
+    /// 写入都查询文件元数据。
     pub fn append_log_static(nid: &str, data: &[u8]) {
         let log_path = kn_common::path::agent_dir()
             .join("sessions")
@@ -360,7 +374,7 @@ impl OutputFanout {
         Self::append_log(&log_path, data, &*log_size);
     }
 
-    /// 读取环形日志全部内容，用于恢复时回放。
+    /// 读取活动会话的完整日志，用于恢复时回放。
     pub fn replay_log(nid: &str) -> Option<Vec<u8>> {
         let path = kn_common::path::agent_dir()
             .join("sessions")
@@ -417,29 +431,9 @@ impl OutputFanout {
         }
     }
 
-    /// 截掉日志文件头部，保留尾部 KEEP_TAIL 字节。
-    fn trim_log_head(path: &PathBuf, log_size: &std::sync::atomic::AtomicU64) {
-        let keep = OUTPUT_LOG_KEEP_TAIL as usize;
-        match std::fs::read(path) {
-            Ok(data) if data.len() > keep => {
-                let tail = Self::replay_safe_tail(&data, keep);
-                if let Err(e) = std::fs::write(path, tail) {
-                    tracing::warn!(path = %path.display(), error = %e, "环形日志截断失败");
-                } else {
-                    log_size.store(tail.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    tracing::debug!(path = %path.display(), old_len = data.len(), new_len = tail.len(), "环形日志已截断");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "环形日志读取失败（截断时）")
-            }
-            _ => {}
-        }
-    }
-
-    /// Chooses a safe replay boundary in a raw PTY ring buffer.  Prefer the
-    /// first complete synchronized-output frame after the nominal tail start;
-    /// otherwise skip only a CSI command proven to cross the nominal boundary.
+    /// Chooses a safe replay boundary in a legacy raw PTY ring buffer. Prefer
+    /// the first complete synchronized-output frame after the nominal tail
+    /// start; otherwise skip only a CSI command proven to cross the boundary.
     fn replay_safe_tail(data: &[u8], keep: usize) -> &[u8] {
         let start = data.len().saturating_sub(keep);
         let tail = &data[start..];
@@ -553,6 +547,23 @@ mod tests {
             assert_eq!(result.bytes, 0);
             assert!(result.data.is_empty());
             assert_eq!(result.message, None);
+        });
+    }
+
+    #[test]
+    fn active_session_log_keeps_output_beyond_the_legacy_ring_limit() {
+        with_temp_log("s_complete", |path| {
+            let log_size = AtomicU64::new(0);
+            let first = vec![b'a'; 256 * 1024];
+            let second = vec![b'b'; 256 * 1024];
+
+            OutputFanout::append_log(&path, &first, &log_size);
+            OutputFanout::append_log(&path, &second, &log_size);
+
+            let recovered = std::fs::read(&path).unwrap();
+            assert_eq!(recovered.len(), first.len() + second.len());
+            assert_eq!(&recovered[..first.len()], first.as_slice());
+            assert_eq!(&recovered[first.len()..], second.as_slice());
         });
     }
 

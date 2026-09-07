@@ -4,6 +4,7 @@
 //! agent 正常退出时会删除 session.json；异常崩溃时文件残留，重启时扫描恢复。
 
 use crate::error::Result;
+use crate::session::output::remove_replay_log;
 use crate::session::types::{ManagedSession, SessionKind};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -174,6 +175,7 @@ pub async fn recover_surviving_sessions(
         if !is_alive {
             tracing::info!(nid = %record.nid, pid = record.pid, "恢复扫描: 进程已死，清理");
             delete_session_record(&record.nid);
+            remove_replay_log(&record.nid);
             continue;
         }
 
@@ -217,6 +219,7 @@ pub async fn recover_surviving_sessions(
             Err(e) => {
                 tracing::warn!(nid = %record.nid, error = %e, "恢复会话失败（可能已达上限），清理");
                 delete_session_record(&record.nid);
+                remove_replay_log(&record.nid);
             }
         }
     }
