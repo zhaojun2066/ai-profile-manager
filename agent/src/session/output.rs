@@ -91,6 +91,10 @@ pub(crate) fn get_static_log_size(nid: &str) -> Arc<AtomicU64> {
 const OUTPUT_LOG_MAX_SIZE: u64 = 256 * 1024;
 /// 截断后保留的尾部字节数
 const OUTPUT_LOG_KEEP_TAIL: u64 = 192 * 1024;
+/// Codex wraps atomic screen updates with this marker.  Keeping a replay log
+/// from one of these boundaries ensures a freshly-created terminal does not
+/// start in the middle of a CSI sequence after ring-buffer truncation.
+const SYNCHRONIZED_OUTPUT_START: &[u8] = b"\x1b[?2026h";
 
 impl OutputFanout {
     /// 创建 OutputFanout 并启动 100ms 定时 flush 任务。
@@ -418,7 +422,7 @@ impl OutputFanout {
         let keep = OUTPUT_LOG_KEEP_TAIL as usize;
         match std::fs::read(path) {
             Ok(data) if data.len() > keep => {
-                let tail = &data[data.len() - keep..];
+                let tail = Self::replay_safe_tail(&data, keep);
                 if let Err(e) = std::fs::write(path, tail) {
                     tracing::warn!(path = %path.display(), error = %e, "环形日志截断失败");
                 } else {
@@ -431,6 +435,41 @@ impl OutputFanout {
             }
             _ => {}
         }
+    }
+
+    /// Chooses a safe replay boundary in a raw PTY ring buffer.  Prefer the
+    /// first complete synchronized-output frame after the nominal tail start;
+    /// otherwise skip only a CSI command proven to cross the nominal boundary.
+    fn replay_safe_tail(data: &[u8], keep: usize) -> &[u8] {
+        let start = data.len().saturating_sub(keep);
+        let tail = &data[start..];
+        let safe_offset = tail
+            .windows(SYNCHRONIZED_OUTPUT_START.len())
+            .position(|window| window == SYNCHRONIZED_OUTPUT_START)
+            .or_else(|| Self::csi_sequence_crossing(data, start).map(|end| end - start))
+            .unwrap_or(0);
+        &tail[safe_offset..]
+    }
+
+    /// Detects a CSI sequence which began shortly before the nominal tail and
+    /// ends at or after it. This also handles a tail that starts at the final
+    /// byte (for example `m` from `ESC[31m`).
+    fn csi_sequence_crossing(data: &[u8], start: usize) -> Option<usize> {
+        const LOOKBACK: usize = 256;
+        let lower_bound = start.saturating_sub(LOOKBACK);
+        for candidate in (lower_bound..start).rev() {
+            if data.get(candidate..candidate + 2) != Some(b"\x1b[") {
+                continue;
+            }
+            let mut index = candidate + 2;
+            while index < data.len() && (0x20..=0x3f).contains(&data[index]) {
+                index += 1;
+            }
+            if index < data.len() && (0x40..=0x7e).contains(&data[index]) && index >= start {
+                return Some(index + 1);
+            }
+        }
+        None
     }
 }
 
@@ -517,6 +556,54 @@ mod tests {
             assert!(result.data.is_empty());
             assert!(result.message.is_some());
         });
+    }
+
+    #[test]
+    fn replay_safe_tail_skips_a_truncated_csi_prefix_to_a_full_frame() {
+        let mut output = b"old-output-old-output;2H".to_vec();
+        output.extend_from_slice(b"\x1b[0m\x1b[?2026hcomplete frame\x1b[?2026l");
+
+        let tail = OutputFanout::replay_safe_tail(&output, 40);
+
+        assert_eq!(tail, b"\x1b[?2026hcomplete frame\x1b[?2026l");
+    }
+
+    #[test]
+    fn replay_safe_tail_keeps_plain_output_before_a_later_escape_sequence() {
+        let suffix = b"normal output \x1b[31mred";
+        let mut output = b"old-output".to_vec();
+        output.extend_from_slice(suffix);
+
+        let tail = OutputFanout::replay_safe_tail(&output, suffix.len());
+
+        assert_eq!(tail, suffix);
+    }
+
+    #[test]
+    fn replay_safe_tail_preserves_plain_output_without_a_verifiable_escape_boundary() {
+        let output = b"old-output;2Hplain output";
+
+        let tail = OutputFanout::replay_safe_tail(output, 15);
+
+        assert_eq!(tail, b";2Hplain output");
+    }
+
+    #[test]
+    fn replay_safe_tail_never_treats_plain_text_as_a_csi_continuation() {
+        let output = b"old-output1 file changed";
+
+        let tail = OutputFanout::replay_safe_tail(output, 14);
+
+        assert_eq!(tail, b"1 file changed");
+    }
+
+    #[test]
+    fn replay_safe_tail_drops_the_final_byte_of_a_csi_crossing_the_boundary() {
+        let output = b"old-output\x1b[31mplain output";
+
+        let tail = OutputFanout::replay_safe_tail(output, 13);
+
+        assert_eq!(tail, b"plain output");
     }
 
     #[test]
